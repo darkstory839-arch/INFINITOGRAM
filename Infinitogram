@@ -1,0 +1,163 @@
+require("dotenv").config();
+const express  = require("express");
+const cors     = require("cors");
+const bcrypt   = require("bcryptjs");
+const jwt      = require("jsonwebtoken");
+const Database = require("better-sqlite3");
+const path     = require("path");
+
+const app = express();
+app.use(cors());
+app.use(express.json({ limit: "10mb" }));
+
+const API_KEY    = process.env.API_KEY    || "YOUR_SERVER_API_KEY_HERE";
+const JWT_SECRET = process.env.JWT_SECRET || "change-me-please";
+const PORT       = process.env.PORT       || 3000;
+
+/* SQLite file — Render ephemeral disk, data resets on redeploy */
+const db = new Database(path.join(__dirname, "astrn.db"));
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT UNIQUE NOT NULL COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    dp            TEXT,
+    bio           TEXT DEFAULT 'Creator at ASTRN',
+    followers     INTEGER DEFAULT 0,
+    following     INTEGER DEFAULT 0,
+    created_at    INTEGER DEFAULT (strftime('%s','now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    sender     TEXT NOT NULL,
+    receiver   TEXT NOT NULL,
+    cipher     TEXT NOT NULL,
+    mode       TEXT NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s','now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_msg_pair
+    ON messages(sender, receiver, id);
+`);
+
+/* API key guard */
+app.use("/api", (req, res, next) => {
+  if (req.header("x-api-key") !== API_KEY)
+    return res.status(401).json({ error: "Invalid API key" });
+  next();
+});
+
+/* Password rule: 2 upper, 2 lower, 1 num, 1 special, min 6 */
+function validatePassword(pw) {
+  return typeof pw === "string"
+    && pw.length >= 6
+    && (pw.match(/[A-Z]/g) || []).length >= 2
+    && (pw.match(/[a-z]/g) || []).length >= 2
+    && (pw.match(/[0-9]/g) || []).length >= 1
+    && (pw.match(/[^A-Za-z0-9]/g) || []).length >= 1;
+}
+
+app.get("/", (_, res) => res.send("ASTRN server is running"));
+app.get("/api/health", (_, res) => res.json({ ok: true, ts: Date.now() }));
+
+/* ============ AUTH ============ */
+app.post("/api/auth/register", async (req, res) => {
+  const { username, password, dp } = req.body || {};
+  if (!username || username.length < 2)
+    return res.status(400).json({ error: "Username too short" });
+  if (!validatePassword(password))
+    return res.status(400).json({ error: "Password does not meet requirements" });
+
+  const exists = db.prepare(
+    "SELECT id FROM users WHERE username = ?"
+  ).get(username);
+  if (exists) return res.status(409).json({ error: "Username already taken" });
+
+  const hash = await bcrypt.hash(password, 10);
+  const info = db.prepare(
+    "INSERT INTO users (username, password_hash, dp) VALUES (?, ?, ?)"
+  ).run(username, hash, dp || null);
+
+  const user = db.prepare(
+    "SELECT id, username, dp, bio, followers, following FROM users WHERE id = ?"
+  ).get(info.lastInsertRowid);
+
+  const token = jwt.sign(
+    { id: user.id, username: user.username },
+    JWT_SECRET,
+    { expiresIn: "30d" }
+  );
+  res.json({ user, token });
+});
+
+app.post("/api/auth/login", async (req, res) => {
+  const { username, password } = req.body || {};
+  const row = db.prepare("SELECT * FROM users WHERE username = ?").get(username);
+  if (!row) return res.status(401).json({ error: "Invalid credentials" });
+
+  const ok = await bcrypt.compare(password, row.password_hash);
+  if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+
+  const { password_hash, ...safe } = row;
+  const token = jwt.sign(
+    { id: row.id, username: row.username },
+    JWT_SECRET,
+    { expiresIn: "30d" }
+  );
+  res.json({ user: safe, token });
+});
+
+/* ============ MESSAGES ============ */
+app.post("/api/messages/send", (req, res) => {
+  const { from, to, cipher, mode } = req.body || {};
+  if (!from || !to || !cipher)
+    return res.status(400).json({ error: "Missing fields" });
+  if (!["plain", "privacy", "ultra"].includes(mode))
+    return res.status(400).json({ error: "Bad mode" });
+
+  const info = db.prepare(
+    "INSERT INTO messages (sender, receiver, cipher, mode) VALUES (?, ?, ?, ?)"
+  ).run(from, to, cipher, mode);
+
+  res.json({ id: info.lastInsertRowid, ok: true });
+});
+
+app.get("/api/messages", (req, res) => {
+  const { me, with: other, since } = req.query;
+  if (!me || !other)
+    return res.status(400).json({ error: "Missing me / with" });
+
+  let rows;
+  if (since) {
+    rows = db.prepare(`
+      SELECT id, sender, receiver, cipher, mode, created_at
+      FROM messages
+      WHERE ((sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?))
+        AND id > ?
+      ORDER BY id ASC
+    `).all(me, other, other, me, Number(since));
+  } else {
+    rows = db.prepare(`
+      SELECT id, sender, receiver, cipher, mode, created_at
+      FROM messages
+      WHERE (sender = ? AND receiver = ?) OR (sender = ? AND receiver = ?)
+      ORDER BY id ASC
+    `).all(me, other, other, me);
+  }
+  res.json({ messages: rows });
+});
+
+/* ============ USERS ============ */
+app.get("/api/users", (req, res) => {
+  const q = (req.query.q || "").toLowerCase();
+  const rows = db.prepare(
+    "SELECT id, username, dp, bio, followers, following FROM users WHERE LOWER(username) LIKE ? LIMIT 30"
+  ).all("%" + q + "%");
+  res.json({ users: rows });
+});
+
+app.listen(PORT, () =>
+  console.log("ASTRN server running on port " + PORT)
+);
